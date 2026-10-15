@@ -10,8 +10,11 @@ import kotlin.math.min
  * Algorithm:
  *  1. Build a cost matrix. If road distances are supplied, use them.
  *     Otherwise use haversine (straight-line) distances.
- *  2. Nearest-Neighbour initial tour (greedy, from start point).
- *  3. 2-opt improvement: repeatedly reverse segments while it reduces
+ *  2. Urgent stops first: the urgent subset is toured (NN + 2-opt) from the
+ *     start, then the remaining stops from the end of the urgent tour.
+ *     2-opt never crosses the urgent boundary, so urgent stays first.
+ *  3. Nearest-Neighbour initial tour (greedy, from start point).
+ *  4. 2-opt improvement: repeatedly reverse segments while it reduces
  *     total tour cost. Capped so 100 stops still finish quickly.
  *
  * Tour is OPEN (does not return to start) - correct for deliveries.
@@ -24,7 +27,9 @@ object RouteOptimizer {
         val id: Long,
         val lat: Double?,
         val lng: Double?,
-        val label: String
+        val label: String,
+        /** Time-sensitive stop - served before all non-urgent stops. */
+        val isUrgent: Boolean = false
     )
 
     data class StartPoint(val lat: Double, val lng: Double)
@@ -117,48 +122,62 @@ object RouteOptimizer {
             return Haversine.estimateDurationMin(cost(fromIdx, toIdx))
         }
 
-        // --- 1. Nearest Neighbour -----------------------------------------
-        val unvisited = geocoded.indices.toMutableSet()
-        val tour = mutableListOf<Int>()
-        var current = -1 // start
-        while (unvisited.isNotEmpty()) {
-            var best: Int? = null
-            var bestCost = Double.MAX_VALUE
-            for (cand in unvisited) {
-                val c = cost(current, cand)
-                if (c < bestCost) { bestCost = c; best = cand }
+        // --- 1. Nearest Neighbour + 2-opt over one subset ------------------
+        // A tour is built for one subset (urgent, then rest). 2-opt never
+        // crosses the subset boundary, so urgent stops always stay first.
+        fun buildTour(idxs: List<Int>, originIdx: Int): MutableList<Int> {
+            if (idxs.isEmpty()) return mutableListOf()
+            // Nearest Neighbour from originIdx.
+            val unvisited = idxs.toMutableSet()
+            val tour = mutableListOf<Int>()
+            var current = originIdx
+            while (unvisited.isNotEmpty()) {
+                var best: Int? = null
+                var bestCost = Double.MAX_VALUE
+                for (cand in unvisited) {
+                    val c = cost(current, cand)
+                    if (c < bestCost) { bestCost = c; best = cand }
+                }
+                val chosen = best ?: break
+                tour.add(chosen)
+                unvisited.remove(chosen)
+                current = chosen
             }
-            val chosen = best ?: break
-            tour.add(chosen)
-            unvisited.remove(chosen)
-            current = chosen
-        }
 
-        // --- 2. 2-opt improvement (open tour) ------------------------------
-        // For an open tour, reversing segment [i..k] changes cost by:
-        //   - cost(prev(i), i) - cost(k, next(k)) + cost(prev(i), k) + cost(i, next(k))
-        // where prev(-1) is start and next(end) does not exist.
-        var improved = true
-        var iterations = 0
-        while (improved && iterations < maxTwoOptIterations) {
-            improved = false
-            iterations++
-            outer@ for (i in 0 until tour.size - 1) {
-                for (k in i + 1 until tour.size) {
-                    val a = if (i == 0) -1 else tour[i - 1]
-                    val b = tour[i]
-                    val c = tour[k]
-                    val d = if (k == tour.size - 1) null else tour[k + 1]
-                    val before = cost(a, b) + (if (d == null) 0.0 else cost(c, d))
-                    val after = cost(a, c) + (if (d == null) 0.0 else cost(b, d))
-                    if (after + 1e-9 < before) {
-                        tour.subList(i, k + 1).reverse()
-                        improved = true
-                        break@outer
+            // 2-opt improvement (open tour) within this subset only.
+            // Reversing segment [i..k] changes cost by:
+            //   - cost(prev(i), i) - cost(k, next(k)) + cost(prev(i), k) + cost(i, next(k))
+            // where prev(0) is originIdx and next(end) does not exist.
+            var improved = true
+            var iterations = 0
+            while (improved && iterations < maxTwoOptIterations) {
+                improved = false
+                iterations++
+                outer@ for (i in 0 until tour.size - 1) {
+                    for (k in i + 1 until tour.size) {
+                        val a = if (i == 0) originIdx else tour[i - 1]
+                        val b = tour[i]
+                        val c = tour[k]
+                        val d = if (k == tour.size - 1) null else tour[k + 1]
+                        val before = cost(a, b) + (if (d == null) 0.0 else cost(c, d))
+                        val after = cost(a, c) + (if (d == null) 0.0 else cost(b, d))
+                        if (after + 1e-9 < before) {
+                            tour.subList(i, k + 1).reverse()
+                            improved = true
+                            break@outer
+                        }
                     }
                 }
             }
+            return tour
         }
+
+        // --- 2. Urgent-first: urgent tour, then the rest from its end ------
+        val urgentIdx = geocoded.indices.filter { geocoded[it].isUrgent }
+        val restIdx = geocoded.indices.filter { !geocoded[it].isUrgent }
+        val tour = mutableListOf<Int>()
+        tour += buildTour(urgentIdx, -1)
+        tour += buildTour(restIdx, tour.lastOrNull() ?: -1)
 
         // --- Totals ---------------------------------------------------------
         var totalDist = 0.0

@@ -77,12 +77,25 @@ class ParcelRepository(private val dao: ParcelDao) {
         dao.updateStatus(id, status.name)
     }
 
+    suspend fun setUrgent(id: Long, urgent: Boolean) {
+        dao.getById(id)?.let { dao.update(it.copy(isUrgent = urgent)) }
+    }
+
+    suspend fun setCodAmount(id: Long, amount: Double?) {
+        dao.getById(id)?.let { dao.update(it.copy(codAmount = amount)) }
+    }
+
+    suspend fun setCashCollected(id: Long, collected: Boolean) {
+        dao.getById(id)?.let { dao.update(it.copy(cashCollected = collected)) }
+    }
+
     suspend fun setGeocodeResult(
         id: Long,
         lat: Double?,
         lng: Double?,
         status: GeocodeStatus,
-        error: String?
+        error: String?,
+        displayName: String? = null
     ) {
         val existing = dao.getById(id) ?: return
         dao.update(
@@ -90,7 +103,9 @@ class ParcelRepository(private val dao: ParcelDao) {
                 lat = lat,
                 lng = lng,
                 geocodeStatus = status.name,
-                geocodeError = error
+                geocodeError = error,
+                // Keep the old displayName when the caller has none (retry w/o name).
+                displayName = displayName ?: existing.displayName
             )
         )
     }

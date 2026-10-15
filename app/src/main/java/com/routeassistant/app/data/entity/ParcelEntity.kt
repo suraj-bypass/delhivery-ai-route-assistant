@@ -26,6 +26,12 @@ data class ParcelEntity(
     val status: String = DeliveryStatus.PENDING.name,
     val orderIndex: Int = Int.MAX_VALUE,
     val duplicateOfId: Long? = null,
+    /** Time-sensitive / urgent parcel - optimiser serves urgent stops first. */
+    val isUrgent: Boolean = false,
+    /** Cash-on-delivery amount for this parcel (null = no COD). */
+    val codAmount: Double? = null,
+    /** True once the COD cash for this parcel has been collected. */
+    val cashCollected: Boolean = false,
     val createdAt: Long = System.currentTimeMillis()
 ) {
     val isDuplicate: Boolean get() = duplicateOfId != null

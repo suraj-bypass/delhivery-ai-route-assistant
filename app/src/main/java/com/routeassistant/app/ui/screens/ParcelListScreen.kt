@@ -60,10 +60,18 @@ fun ParcelListScreen(
     var showAdd by remember { mutableStateOf(false) }
     var showBulk by remember { mutableStateOf(false) }
     var addText by remember { mutableStateOf("") }
+    var addCod by remember { mutableStateOf("") }
     var bulkText by remember { mutableStateOf("") }
     var editTarget by remember { mutableStateOf<ParcelEntity?>(null) }
     var editText by remember { mutableStateOf("") }
+    var editCod by remember { mutableStateOf("") }
     var isOcrRunning by remember { mutableStateOf(false) }
+
+    val areaCounts = remember(state.parcels) {
+        com.routeassistant.app.domain.grouping.ParcelGrouping.areaCounts(state.parcels)
+    }
+    val pendingCount = state.parcels.count { it.status == DeliveryStatus.PENDING.name }
+    val deliveredCount = state.parcels.count { it.status == DeliveryStatus.DELIVERED.name }
 
     LaunchedEffect(state.error, state.info) {
         val msg = state.error ?: state.info
@@ -123,8 +131,8 @@ fun ParcelListScreen(
         }
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(onClick = { viewModel.geocodeAll() }, enabled = !state.isGeocoding) {
-                Text(if (state.isGeocoding) "Geocoding…" else "Geocode All")
+            Button(onClick = { viewModel.geocodeAll() }, enabled = !state.isGeocoding, modifier = Modifier.weight(1f)) {
+                Text(if (state.isGeocoding) "Geocoding…" else "Geocode All", maxLines = 1, softWrap = false)
             }
             Button(
                 onClick = {
@@ -132,11 +140,14 @@ fun ParcelListScreen(
                     viewModel.optimizeRoute()
                     onOpenRoute()
                 },
-                enabled = !state.isOptimizing && state.parcels.isNotEmpty()
+                enabled = !state.isOptimizing && state.parcels.isNotEmpty(),
+                modifier = Modifier.weight(1f)
             ) {
-                Text(if (state.isOptimizing) "Optimising…" else "Optimize Route")
+                Text(if (state.isOptimizing) "Optimising…" else "Optimize Route", maxLines = 1, softWrap = false)
             }
-            OutlinedButton(onClick = onOpenRoute) { Text("Route") }
+            OutlinedButton(onClick = onOpenRoute, modifier = Modifier.weight(1f)) {
+                Text("Route", maxLines = 1, softWrap = false)
+            }
         }
         if (state.isGeocoding || state.isOptimizing || isOcrRunning) {
             Row(Modifier.padding(vertical = 8.dp)) {
@@ -146,14 +157,28 @@ fun ParcelListScreen(
         }
         if (state.parcels.isEmpty()) {
             Text("No parcels yet. Add one, paste many, or OCR a screenshot.", modifier = Modifier.padding(vertical = 16.dp))
+        } else {
+            Text(
+                "${state.parcels.size} parcels • $pendingCount pending • $deliveredCount delivered",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(vertical = 4.dp)
+            )
+            Text(
+                areaCounts.joinToString(" | ") { "${it.area} • ${it.count}" },
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
         }
         LazyColumn(modifier = Modifier.weight(1f)) {
             items(state.parcels, key = { it.id }) { parcel ->
                 ParcelRow(
                     parcel = parcel,
-                    onEdit = { editTarget = parcel; editText = parcel.rawAddress },
+                    onEdit = { editTarget = parcel; editText = parcel.rawAddress; editCod = parcel.codAmount?.toString() ?: "" },
                     onDelete = { viewModel.deleteParcel(parcel.id) },
-                    onRetryGeocode = { viewModel.retryGeocode(parcel) }
+                    onRetryGeocode = { viewModel.retryGeocode(parcel) },
+                    onMoveUp = { viewModel.moveParcelUp(parcel.id) },
+                    onMoveDown = { viewModel.moveParcelDown(parcel.id) },
+                    onToggleUrgent = { viewModel.setUrgent(parcel.id, !parcel.isUrgent) }
                 )
             }
         }
@@ -169,11 +194,24 @@ fun ParcelListScreen(
             onDismissRequest = { showAdd = false },
             title = { Text("Add Parcel") },
             text = {
-                OutlinedTextField(value = addText, onValueChange = { addText = it }, label = { Text("Full address incl. pincode") }, modifier = Modifier.fillMaxWidth())
+                Column {
+                    OutlinedTextField(value = addText, onValueChange = { addText = it }, label = { Text("Full address incl. pincode") }, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = addCod,
+                        onValueChange = { addCod = it },
+                        label = { Text("COD amount (optional, ₹)") },
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text("Tip: pasting multiple lines here splits them into separate parcels.", style = MaterialTheme.typography.bodySmall)
+                }
             },
             confirmButton = {
                 Button(onClick = {
-                    viewModel.addParcel(addText); addText = ""; showAdd = false
+                    viewModel.addParcel(addText, addCod.toDoubleOrNull()); addText = ""; addCod = ""; showAdd = false
                 }) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { showAdd = false }) { Text("Cancel") } }
@@ -200,10 +238,22 @@ fun ParcelListScreen(
             onDismissRequest = { editTarget = null },
             title = { Text("Edit Parcel") },
             text = {
-                OutlinedTextField(value = editText, onValueChange = { editText = it }, label = { Text("Address") }, modifier = Modifier.fillMaxWidth())
+                Column {
+                    OutlinedTextField(value = editText, onValueChange = { editText = it }, label = { Text("Address") }, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = editCod,
+                        onValueChange = { editCod = it },
+                        label = { Text("COD amount (blank = none, ₹)") },
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             },
             confirmButton = {
-                Button(onClick = { viewModel.updateParcel(target, editText); editTarget = null }) { Text("Save") }
+                Button(onClick = { viewModel.updateParcel(target, editText, editCod.toDoubleOrNull()); editTarget = null }) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { editTarget = null }) { Text("Cancel") } }
         )
@@ -215,7 +265,10 @@ fun ParcelRow(
     parcel: ParcelEntity,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onRetryGeocode: () -> Unit
+    onRetryGeocode: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onToggleUrgent: () -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -227,13 +280,20 @@ fun ParcelRow(
             val badges = mutableListOf<String>()
             badges.add("Geo: ${parcel.geocodeStatus}")
             badges.add("Delivery: ${parcel.status}")
+            if (parcel.isUrgent) badges.add("URGENT")
             if (parcel.isDuplicate) badges.add("DUPLICATE of #${parcel.duplicateOfId}")
             if (parcel.lat != null) badges.add("(${parcel.lat}, ${parcel.lng})")
             Text(badges.joinToString(" • "), style = MaterialTheme.typography.bodySmall)
+            if (parcel.codAmount != null) {
+                Text(
+                    "COD ₹${parcel.codAmount} • Cash: ${if (parcel.cashCollected) "collected" else "pending"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             if (parcel.geocodeError != null) {
                 Text("Error: ${parcel.geocodeError}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onEdit) { Text("Edit") }
                 TextButton(onClick = onDelete) { Text("Delete") }
                 if (parcel.geocodeStatus == GeocodeStatus.FAILED.name || parcel.geocodeStatus == GeocodeStatus.PENDING.name) {
@@ -241,6 +301,13 @@ fun ParcelRow(
                 }
                 if (parcel.status == DeliveryStatus.PENDING.name) {
                     Text("• Pending", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onMoveUp) { Text("↑ Move Up") }
+                TextButton(onClick = onMoveDown) { Text("↓ Move Down") }
+                TextButton(onClick = onToggleUrgent) {
+                    Text(if (parcel.isUrgent) "Unmark Urgent" else "Mark Urgent")
                 }
             }
         }

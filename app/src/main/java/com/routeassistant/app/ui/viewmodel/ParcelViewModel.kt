@@ -84,18 +84,60 @@ class ParcelViewModel(
     fun showInfo(msg: String) = _uiState.update { it.copy(info = msg) }
 
     // ---- CRUD -----------------------------------------------------------
-    fun addParcel(raw: String) {
+    /**
+     * Add one parcel. Multi-line input is SPLIT via parseBulk (same as Bulk
+     * Paste) instead of creating one parcel with embedded newlines - that
+     * was a real device-test bug. Single-line input is unchanged.
+     * COD / urgent only apply to the single-line path.
+     */
+    fun addParcel(raw: String, codAmount: Double? = null, isUrgent: Boolean = false) {
         if (raw.isBlank()) { showError("Address is empty."); return }
+        if (raw.contains('\n') || raw.contains('\r')) { bulkImport(raw); return }
         viewModelScope.launch {
             val row = repository.add(raw)
+            if (codAmount != null) repository.setCodAmount(row.id, codAmount)
+            if (isUrgent) repository.setUrgent(row.id, true)
             if (row.isDuplicate) showInfo("Duplicate flagged - saved but marked as duplicate.")
             else showInfo("Parcel added.")
             requestAutoFlow()
         }
     }
 
-    fun updateParcel(parcel: ParcelEntity, newRaw: String) {
-        viewModelScope.launch { repository.updateAddress(parcel.id, newRaw) }
+    fun updateParcel(parcel: ParcelEntity, newRaw: String, codAmount: Double? = null) {
+        viewModelScope.launch {
+            repository.updateAddress(parcel.id, newRaw)
+            // Edit dialog always carries the COD field, so set it as given
+            // (null = cleared). Single source of truth: the dialog value.
+            repository.setCodAmount(parcel.id, codAmount)
+        }
+    }
+
+    /** Manual reorder: swap with neighbour and persist orderIndex (survives restart). */
+    fun moveParcelUp(id: Long) = moveParcel(id, moveUp = true)
+
+    fun moveParcelDown(id: Long) = moveParcel(id, moveUp = false)
+
+    private fun moveParcel(id: Long, moveUp: Boolean) {
+        val currentIds = _uiState.value.parcels.map { it.id }
+        val reordered = com.routeassistant.app.domain.grouping.ParcelGrouping.reorderIds(currentIds, id, moveUp)
+        if (reordered == currentIds) return
+        viewModelScope.launch { repository.saveOrder(reordered) }
+    }
+
+    fun setUrgent(id: Long, urgent: Boolean) {
+        viewModelScope.launch {
+            repository.setUrgent(id, urgent)
+            // Re-optimise so the priority change is reflected in the route.
+            optimizeInternal(repository.getAll())
+        }
+    }
+
+    fun setCodAmount(id: Long, amount: Double?) {
+        viewModelScope.launch { repository.setCodAmount(id, amount) }
+    }
+
+    fun setGroupCashCollected(ids: List<Long>, collected: Boolean) {
+        viewModelScope.launch { ids.forEach { repository.setCashCollected(it, collected) } }
     }
 
     fun deleteParcel(id: Long) {
@@ -176,7 +218,7 @@ class ParcelViewModel(
             for (parcel in pending) {
                 when (val r = geocoder.geocode(parcel.normalizedAddress)) {
                     is AppResult.Ok -> {
-                        repository.setGeocodeResult(parcel.id, r.value.lat, r.value.lng, GeocodeStatus.OK, null)
+                        repository.setGeocodeResult(parcel.id, r.value.lat, r.value.lng, GeocodeStatus.OK, null, r.value.displayName)
                         ok++
                     }
                     is AppResult.Err -> {
@@ -205,7 +247,7 @@ class ParcelViewModel(
         viewModelScope.launch {
             when (val r = geocoder.geocode(parcel.normalizedAddress)) {
                 is AppResult.Ok -> {
-                    repository.setGeocodeResult(parcel.id, r.value.lat, r.value.lng, GeocodeStatus.OK, null)
+                    repository.setGeocodeResult(parcel.id, r.value.lat, r.value.lng, GeocodeStatus.OK, null, r.value.displayName)
                     showInfo("Geocoded: ${parcel.rawAddress.take(40)}")
                 }
                 is AppResult.Err -> {
@@ -245,14 +287,20 @@ class ParcelViewModel(
     private suspend fun optimizeInternal(parcels: List<ParcelEntity>): RouteOptimizer.OptimizedRoute? {
         val pending = parcels.filter { it.status == DeliveryStatus.PENDING.name }
         if (pending.isEmpty()) return null
+        // Same-address parcels combine into ONE stop (grouped by normalised
+        // address). The optimiser sees stops; parcel ids expand back below.
+        val groups = com.routeassistant.app.domain.grouping.ParcelGrouping.combine(pending)
         _uiState.update { it.copy(isOptimizing = true) }
         try {
             val start = if (_uiState.value.startLat != null && _uiState.value.startLng != null) {
                 RouteOptimizer.StartPoint(_uiState.value.startLat!!, _uiState.value.startLng!!)
             } else null
 
-            val stops = pending.map {
-                RouteOptimizer.StopInput(it.id, it.lat, it.lng, it.rawAddress)
+            val stops = groups.map {
+                RouteOptimizer.StopInput(
+                    it.parcels.first().id, it.lat, it.lng,
+                    it.key, isUrgent = it.urgentAny
+                )
             }
             // Try road matrix first (OSRM). On ANY failure, fall back to haversine.
             var roadMatrix: List<List<com.routeassistant.app.data.routing.MatrixCell>>? = null
@@ -281,8 +329,13 @@ class ParcelViewModel(
                 val roadNote = if (result.usedRoadDistances) " (road distances)" else " (straight-line distances - road data unavailable)"
                 val exclNote = if (result.excluded.isNotEmpty()) " Excluded ${result.excluded.size} ungeocoded." else ""
                 showInfo("Optimised ${result.orderedStops.size} stops$roadNote.$exclNote")
-                // Persist order so it survives restart.
-                repository.saveOrder(result.orderedStops.map { it.id })
+                // Persist order so it survives restart. Expand grouped stops
+                // back to parcel ids (group members stay adjacent, in order).
+                val groupsByKey = groups.associateBy { it.key }
+                val expandedIds = result.orderedStops.flatMap { stop ->
+                    groupsByKey[stop.label]?.parcelIds ?: listOf(stop.id)
+                }
+                repository.saveOrder(expandedIds)
             }
             return result
         } catch (e: Exception) {
@@ -324,16 +377,50 @@ class ParcelViewModel(
         optimizeRoute()
     }
 
-    fun markDelivered(id: Long) {
-        viewModelScope.launch { repository.setDeliveryStatus(id, DeliveryStatus.DELIVERED) }
+    /**
+     * Marking a stop complete re-optimises the REMAINING pending stops so
+     * the next-best suggestion updates immediately. Status default for new
+     * parcels stays PENDING - nothing here auto-marks anything DELIVERED
+     * except this explicit user action.
+     */
+    fun markDelivered(id: Long, cashCollected: Boolean = false) {
+        viewModelScope.launch {
+            repository.setDeliveryStatus(id, DeliveryStatus.DELIVERED)
+            if (cashCollected) repository.setCashCollected(id, true)
+            optimizeInternal(repository.getAll())
+        }
+    }
+
+    /** Group delivery: ALL parcels at the stop are marked at once. */
+    fun markGroupDelivered(ids: List<Long>, cashCollected: Boolean = false) {
+        viewModelScope.launch {
+            ids.forEach {
+                repository.setDeliveryStatus(it, DeliveryStatus.DELIVERED)
+                if (cashCollected) repository.setCashCollected(it, true)
+            }
+            optimizeInternal(repository.getAll())
+        }
+    }
+
+    fun markGroupSkipped(ids: List<Long>) {
+        viewModelScope.launch {
+            ids.forEach { repository.setDeliveryStatus(it, DeliveryStatus.SKIPPED) }
+            optimizeInternal(repository.getAll())
+        }
     }
 
     fun markSkipped(id: Long) {
-        viewModelScope.launch { repository.setDeliveryStatus(id, DeliveryStatus.SKIPPED) }
+        viewModelScope.launch {
+            repository.setDeliveryStatus(id, DeliveryStatus.SKIPPED)
+            optimizeInternal(repository.getAll())
+        }
     }
 
     fun markFailed(id: Long) {
-        viewModelScope.launch { repository.setDeliveryStatus(id, DeliveryStatus.FAILED) }
+        viewModelScope.launch {
+            repository.setDeliveryStatus(id, DeliveryStatus.FAILED)
+            optimizeInternal(repository.getAll())
+        }
     }
 
     fun clearCompleted() {
@@ -345,7 +432,7 @@ class ParcelViewModel(
 
     /** CSV export of current parcels (for backup / debugging). No upload. */
     fun exportCsv(): String {
-        val header = "id,rawAddress,lat,lng,geocodeStatus,status,duplicateOfId\n"
+        val header = "id,rawAddress,lat,lng,geocodeStatus,status,duplicateOfId,isUrgent,codAmount,cashCollected\n"
         val rows = _uiState.value.parcels.joinToString("\n") { p ->
             listOf(
                 p.id.toString(),
@@ -354,7 +441,10 @@ class ParcelViewModel(
                 p.lng?.toString() ?: "",
                 p.geocodeStatus,
                 p.status,
-                p.duplicateOfId?.toString() ?: ""
+                p.duplicateOfId?.toString() ?: "",
+                p.isUrgent.toString(),
+                p.codAmount?.toString() ?: "",
+                p.cashCollected.toString()
             ).joinToString(",")
         }
         return header + rows
