@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">Route Assistant</string>
+    <string name="app_subtitle">Unofficial route helper — not affiliated with Delhivery</string>
+    <string name="parcels_title">Parcels</string>
+    <string name="route_title">Optimized Route</string>
+    <string name="add_parcel">Add Parcel</string>
+    <string name="bulk_paste">Bulk Paste</string>
+    <string name="ocr_screenshot">OCR Screenshot</string>
+    <string name="geocode_all">Geocode All</string>
+    <string name="optimize_route">Optimize Route</string>
+    <string name="navigate_next">Navigate Next</string>
+    <string name="mark_delivered">Delivered</string>
+    <string name="mark_skipped">Skip</string>
+    <string name="recalculate">Recalculate</string>
+    <string name="clear_completed">Clear Delivered / Skipped</string>
+    <string name="export_csv">Export CSV</string>
+    <string name="retry">Retry</string>
+    <string name="delete">Delete</string>
+    <string name="edit">Edit</string>
+    <string name="cancel">Cancel</string>
+    <string name="save">Save</string>
+    <string name="confirm">Confirm</string>
+    <string name="empty_parcels">No parcels yet. Add one, paste many, or OCR a screenshot.</string>
+    <string name="no_text_found">No text found in this image. Try a clearer screenshot.</string>
+    <string name="gps_denied_hint">Location permission denied. Route will start from the first stop. You can grant location in Settings or enter a start address manually.</string>
+    <string name="disclaimer">Unofficial prototype. Not affiliated with or endorsed by Delhivery. Data stays on this device.</string>
+</resources>
