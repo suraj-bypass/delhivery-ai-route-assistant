@@ -53,11 +53,28 @@ class ParcelViewModel(
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
     private var geocodeJob: Job? = null
+    private var autoJob: Job? = null
+    private var autoFlowRequested = false
+    private var launchRestoreAttempted = false
 
     init {
         viewModelScope.launch {
             repository.observeAll().collect { list ->
+                val hadNoRoute = _uiState.value.optimizedRoute == null
                 _uiState.update { it.copy(parcels = list) }
+                // Auto-optimise on launch / restart: Room already restored parcels
+                // + coordinates. Run once, only if a pending geocoded stop exists
+                // and there is no route yet. No location fetch here (no permission
+                // prompt on launch); optimise runs with start = null if needed.
+                if (!launchRestoreAttempted) {
+                    launchRestoreAttempted = true
+                    val hasCoordsPending = list.any {
+                        it.status == DeliveryStatus.PENDING.name && it.lat != null && it.lng != null
+                    }
+                    if (hadNoRoute && hasCoordsPending) {
+                        viewModelScope.launch { optimizeInternal(list) }
+                    }
+                }
             }
         }
     }
@@ -72,7 +89,8 @@ class ParcelViewModel(
         viewModelScope.launch {
             val row = repository.add(raw)
             if (row.isDuplicate) showInfo("Duplicate flagged - saved but marked as duplicate.")
-            else showInfo("Parcel added. Tap Geocode All before optimising.")
+            else showInfo("Parcel added.")
+            requestAutoFlow()
         }
     }
 
@@ -102,7 +120,8 @@ class ParcelViewModel(
         viewModelScope.launch {
             val result = repository.addBulk(parsed.addresses)
             val dupNote = if (parsed.duplicates.isNotEmpty()) " Duplicates flagged: ${parsed.duplicates.size}." else ""
-            showInfo("Added ${result.inserted.size} parcels.$dupNote Tap Geocode All.")
+            showInfo("Added ${result.inserted.size} parcels.$dupNote")
+            requestAutoFlow()
         }
     }
 
@@ -135,22 +154,25 @@ class ParcelViewModel(
         viewModelScope.launch {
             val result = repository.addBulk(selected)
             _uiState.update { it.copy(ocrCandidates = emptyList()) }
-            showInfo("Saved ${result.inserted.size} parcels from OCR. Tap Geocode All.")
+            showInfo("Saved ${result.inserted.size} parcels from OCR.")
+            requestAutoFlow()
         }
     }
 
     fun clearOcrCandidates() = _uiState.update { it.copy(ocrCandidates = emptyList()) }
 
     // ---- Geocoding ------------------------------------------------------
-    fun geocodeAll() {
-        if (geocodeJob?.isActive == true) return
-        geocodeJob = viewModelScope.launch {
-            val pending = _uiState.value.parcels.filter {
-                it.geocodeStatus == GeocodeStatus.PENDING.name || it.geocodeStatus == GeocodeStatus.FAILED.name
-            }
-            if (pending.isEmpty()) { showInfo("Nothing to geocode."); return@launch }
-            _uiState.update { it.copy(isGeocoding = true) }
-            var ok = 0; var failed = 0; var lastError: String? = null
+    private data class GeocodeOutcome(val attempted: Int, val ok: Int, val failed: Int, val lastError: String?)
+
+    /** Geocode all PENDING/FAILED parcels. Returns outcome; caller shows messages. */
+    private suspend fun geocodePendingInternal(): GeocodeOutcome {
+        val pending = repository.getAll().filter {
+            it.geocodeStatus == GeocodeStatus.PENDING.name || it.geocodeStatus == GeocodeStatus.FAILED.name
+        }
+        if (pending.isEmpty()) return GeocodeOutcome(0, 0, 0, null)
+        _uiState.update { it.copy(isGeocoding = true) }
+        var ok = 0; var failed = 0; var lastError: String? = null
+        try {
             for (parcel in pending) {
                 when (val r = geocoder.geocode(parcel.normalizedAddress)) {
                     is AppResult.Ok -> {
@@ -163,9 +185,19 @@ class ParcelViewModel(
                     }
                 }
             }
+        } finally {
             _uiState.update { it.copy(isGeocoding = false) }
-            if (failed > 0) showError("Geocoded $ok, failed $failed. Last error: $lastError")
-            else showInfo("Geocoded $ok parcels.")
+        }
+        return GeocodeOutcome(pending.size, ok, failed, lastError)
+    }
+
+    fun geocodeAll() {
+        if (geocodeJob?.isActive == true) return
+        geocodeJob = viewModelScope.launch {
+            val outcome = geocodePendingInternal()
+            if (outcome.attempted == 0) showInfo("Nothing to geocode.")
+            else if (outcome.failed > 0) showError("Geocoded ${outcome.ok}, failed ${outcome.failed}. Last error: ${outcome.lastError}")
+            else showInfo("Geocoded ${outcome.ok} parcels.")
         }
     }
 
@@ -206,54 +238,84 @@ class ParcelViewModel(
     }
 
     // ---- Optimisation ---------------------------------------------------
+    /**
+     * Optimise over [parcels] (fresh list from repository). Shows user messages.
+     * Returns the optimised route, or null if there was nothing to optimise or it failed.
+     */
+    private suspend fun optimizeInternal(parcels: List<ParcelEntity>): RouteOptimizer.OptimizedRoute? {
+        val pending = parcels.filter { it.status == DeliveryStatus.PENDING.name }
+        if (pending.isEmpty()) return null
+        _uiState.update { it.copy(isOptimizing = true) }
+        try {
+            val start = if (_uiState.value.startLat != null && _uiState.value.startLng != null) {
+                RouteOptimizer.StartPoint(_uiState.value.startLat!!, _uiState.value.startLng!!)
+            } else null
+
+            val stops = pending.map {
+                RouteOptimizer.StopInput(it.id, it.lat, it.lng, it.rawAddress)
+            }
+            // Try road matrix first (OSRM). On ANY failure, fall back to haversine.
+            var roadMatrix: List<List<com.routeassistant.app.data.routing.MatrixCell>>? = null
+            var usedRoad = false
+            if (start != null) {
+                val points = listOf(RoutePoint(start.lat, start.lng)) +
+                    stops.filter { it.lat != null && it.lng != null }
+                        .map { RoutePoint(it.lat!!, it.lng!!) }
+                // Only request a matrix if all pending stops are geocoded; otherwise
+                // the optimizer handles exclusion and the matrix indices would mismatch.
+                if (points.size == stops.size + 1) {
+                    when (val m = routing.distanceMatrix(points)) {
+                        is AppResult.Ok -> { roadMatrix = m.value.matrix; usedRoad = m.value.usedRoadDistances }
+                        is AppResult.Err -> {
+                            // Non-fatal: haversine fallback. Surface once, do not block.
+                            showInfo("Road distances unavailable (${m.message}). Using straight-line distances.")
+                        }
+                    }
+                }
+            }
+            val result = RouteOptimizer.optimize(stops, start, roadMatrix)
+            _uiState.update { it.copy(optimizedRoute = result, isOptimizing = false) }
+            if (result.orderedStops.isEmpty()) {
+                showError("No stops could be optimised. Geocode the parcels first.")
+            } else {
+                val roadNote = if (result.usedRoadDistances) " (road distances)" else " (straight-line distances - road data unavailable)"
+                val exclNote = if (result.excluded.isNotEmpty()) " Excluded ${result.excluded.size} ungeocoded." else ""
+                showInfo("Optimised ${result.orderedStops.size} stops$roadNote.$exclNote")
+                // Persist order so it survives restart.
+                repository.saveOrder(result.orderedStops.map { it.id })
+            }
+            return result
+        } catch (e: Exception) {
+            _uiState.update { it.copy(isOptimizing = false) }
+            showError("Optimisation failed: ${e.message}")
+            return null
+        }
+    }
+
     fun optimizeRoute() {
         val parcels = _uiState.value.parcels
         val pending = parcels.filter { it.status == DeliveryStatus.PENDING.name }
         if (pending.isEmpty()) { showError("No pending parcels to optimise."); return }
         viewModelScope.launch {
-            _uiState.update { it.copy(isOptimizing = true) }
-            try {
-                val start = if (_uiState.value.startLat != null && _uiState.value.startLng != null) {
-                    RouteOptimizer.StartPoint(_uiState.value.startLat!!, _uiState.value.startLng!!)
-                } else null
+            optimizeInternal(repository.getAll())
+        }
+    }
 
-                val stops = pending.map {
-                    RouteOptimizer.StopInput(it.id, it.lat, it.lng, it.rawAddress)
-                }
-                // Try road matrix first (OSRM). On ANY failure, fall back to haversine.
-                var roadMatrix: List<List<com.routeassistant.app.data.routing.MatrixCell>>? = null
-                var usedRoad = false
-                if (start != null) {
-                    val points = listOf(RoutePoint(start.lat, start.lng)) +
-                        stops.filter { it.lat != null && it.lng != null }
-                            .map { RoutePoint(it.lat!!, it.lng!!) }
-                    // Only request a matrix if all pending stops are geocoded; otherwise
-                    // the optimizer handles exclusion and the matrix indices would mismatch.
-                    if (points.size == stops.size + 1) {
-                        when (val m = routing.distanceMatrix(points)) {
-                            is AppResult.Ok -> { roadMatrix = m.value.matrix; usedRoad = m.value.usedRoadDistances }
-                            is AppResult.Err -> {
-                                // Non-fatal: haversine fallback. Surface once, do not block.
-                                showInfo("Road distances unavailable (${m.message}). Using straight-line distances.")
-                            }
-                        }
-                    }
-                }
-                val result = RouteOptimizer.optimize(stops, start, roadMatrix)
-                _uiState.update { it.copy(optimizedRoute = result, isOptimizing = false) }
-                if (result.orderedStops.isEmpty()) {
-                    showError("No stops could be optimised. Geocode the parcels first.")
-                } else {
-                    val roadNote = if (result.usedRoadDistances) " (road distances)" else " (straight-line distances - road data unavailable)"
-                    val exclNote = if (result.excluded.isNotEmpty()) " Excluded ${result.excluded.size} ungeocoded." else ""
-                    showInfo("Optimised ${result.orderedStops.size} stops$roadNote.$exclNote")
-                    // Persist order so it survives restart.
-                    repository.saveOrder(result.orderedStops.map { it.id })
-                }
-            } catch (e: Exception) {
-                _uiState.update { it.copy(isOptimizing = false) }
-                showError("Optimisation failed: ${e.message}")
-            }
+    /**
+     * Auto-flow after add / bulk / OCR-confirm: geocode newly added parcels,
+     * then optimise over fresh data. Messages come from optimizeInternal only,
+     * so one auto-flow produces at most one user-visible message. Rapid
+     * successive requests coalesce into one job that loops until no new work
+     * arrived mid-run. Optimize never triggers geocode in a loop by itself.
+     */
+    private fun requestAutoFlow() {
+        if (autoJob?.isActive == true) { autoFlowRequested = true; return }
+        autoJob = viewModelScope.launch {
+            do {
+                autoFlowRequested = false
+                geocodePendingInternal()
+                optimizeInternal(repository.getAll())
+            } while (autoFlowRequested)
         }
     }
 
