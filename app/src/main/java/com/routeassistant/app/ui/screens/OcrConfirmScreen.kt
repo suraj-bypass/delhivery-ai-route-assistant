@@ -39,7 +39,7 @@ fun OcrConfirmScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     var checked by remember(state.ocrCandidates) {
-        mutableStateOf(state.ocrCandidates.indices.map { true }.toSet())
+        mutableStateOf(state.ocrCandidates.indices.toSet())
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
