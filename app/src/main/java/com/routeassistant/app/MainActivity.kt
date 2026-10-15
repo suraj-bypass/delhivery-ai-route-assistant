@@ -1,5 +1,6 @@
 package com.routeassistant.app
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -26,6 +27,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleSharedText(intent)
         setContent {
             MaterialTheme {
                 Surface {
@@ -33,6 +35,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSharedText(intent)
+    }
+
+    /**
+     * User-authorized import via Android Share (ACTION_SEND, text/plain).
+     * Same behaviour as Bulk Paste: saves + dedupes via bulkImport, then the
+     * ViewModel auto-flow geocodes + optimises. Blank text is ignored silently.
+     * The intent action is cleared after handling so rotation / recreation
+     * does not re-import the same text.
+     */
+    private fun handleSharedText(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        if (intent.type != "text/plain") return
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() } ?: return
+        intent.action = null
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        viewModel.bulkImport(text)
     }
 }
 
