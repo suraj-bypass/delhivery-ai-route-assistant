@@ -231,7 +231,7 @@ class ParcelViewModel(
                     // the optimizer handles exclusion and the matrix indices would mismatch.
                     if (points.size == stops.size + 1) {
                         when (val m = routing.distanceMatrix(points)) {
-                            is AppResult.Ok -> { roadMatrix = m.matrix; usedRoad = m.usedRoadDistances }
+                            is AppResult.Ok -> { roadMatrix = m.value.matrix; usedRoad = m.value.usedRoadDistances }
                             is AppResult.Err -> {
                                 // Non-fatal: haversine fallback. Surface once, do not block.
                                 showInfo("Road distances unavailable (${m.message}). Using straight-line distances.")
